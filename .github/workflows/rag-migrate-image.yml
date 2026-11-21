@@ -1,0 +1,84 @@
+name: rag-migrate-image
+
+# Build the RAG-store Liquibase RUNTIME image and push it to ECR, tagged with
+# the git SHA. The image is a stable runtime ONLY: Liquibase base + Postgres
+# driver + AWS CLI + entrypoint. The changelog/changesets are NOT baked in — the
+# rag-migrate workflow checks out the repo and MOUNTS infra/db/rag into the
+# container at runtime. So a NEW CHANGESET needs NO image rebuild; this image
+# only changes when the runtime does (Dockerfile / entrypoint).
+#
+# Runs on the AWS-hosted CodeBuild runner; AWS auth is the runner's IAM role.
+# The base image is pulled through the ECR pull-through cache via ECR_REGISTRY.
+
+on:
+  # Auto-trigger disabled; run manually via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     # Only runtime-affecting files — NOT the SQL changesets/changelog (those
+  #     # are mounted at runtime, not baked, so they do not change the image).
+  #     - "infra/db/rag/Dockerfile"
+  #     - "infra/db/rag/entrypoint.sh"
+  #     - ".github/workflows/rag-migrate-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/rag-migrate
+
+jobs:
+  build-push:
+    name: build & push rag-migrate runtime image
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${{ steps.registry.outputs.registry }}"
+
+      # Root context + ECR_REGISTRY build-arg so FROM resolves to the
+      # pull-through-cache path (no hardcoded account id). The Dockerfile no
+      # longer COPYs the changelog, so this build is schema-independent.
+      - name: Build image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker build \
+            -f infra/db/rag/Dockerfile \
+            --build-arg ECR_REGISTRY="${{ steps.registry.outputs.registry }}" \
+            -t "${IMAGE}" \
+            .
+          echo "built ${IMAGE}"
+
+      - name: Push image (SHA tag)
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker push "${IMAGE}"
+          echo "pushed ${IMAGE}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed rag-migrate runtime image"
+            echo '```'
+            echo "${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+            echo '```'
+            echo "Runtime only — changelog is mounted at run time. Deploy schema via rag-migrate.yml (command=update)."
+          } >> "$GITHUB_STEP_SUMMARY"

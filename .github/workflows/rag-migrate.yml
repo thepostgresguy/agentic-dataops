@@ -1,0 +1,182 @@
+name: rag-migrate
+
+# Deploy the RAG-store schema with Liquibase. The CodeBuild-hosted GitHub
+# Actions runner is VPC-attached (see aws_codebuild_project.runner vpc_config in
+# codebuild.tf), so it sits INSIDE vpc-0123456789abcdef1 and reaches the private
+# RAG Tiger store directly over the VPC peering. We just `docker run` the
+# already-built Liquibase applier image here — its entrypoint fetches the DSN
+# from Secrets Manager, builds the JDBC URL, and runs the requested command.
+# No ECS task, no run-task indirection.
+#
+# Manual only (workflow_dispatch). Commands:
+#   update          apply pending changesets, then tag the DB with the image SHA
+#   status          show unrun changesets (read-only)
+#   validate        validate the changelog against the DB (read-only)
+#   rollback        roll back to a tag (requires `tag` input) — PREFERRED rollback
+#   rollback-count  roll back the last N changesets (requires `count` input)
+#   release-locks   clear a stuck Liquibase lock
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Liquibase command to run"
+        type: choice
+        required: true
+        default: update
+        options:
+          - update
+          - status
+          - validate
+          - rollback
+          - rollback-count
+          - release-locks
+      tag:
+        description: "Tag to roll back to (for command=rollback)"
+        type: string
+        required: false
+        default: ""
+      count:
+        description: "Number of changesets to roll back (for command=rollback-count)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/rag-migrate
+  # IMAGE_TAG is resolved at run time to the LATEST pushed image (see the
+  # "Resolve latest image tag" step) — no hardcoded SHA to keep in sync.
+
+jobs:
+  migrate:
+    name: "liquibase ${{ inputs.command }}"
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout (provides the changelog mounted into the container)
+        uses: actions/checkout@v4
+
+      - name: Validate inputs & build command args
+        id: cmd
+        env:
+          COMMAND: ${{ inputs.command }}
+          TAG: ${{ inputs.tag }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          set -euo pipefail
+          case "${COMMAND}" in
+            update|status|validate|release-locks)
+              ARGS="${COMMAND}"
+              ;;
+            rollback)
+              test -n "${TAG}" || { echo "::error::command=rollback requires the 'tag' input" >&2; exit 1; }
+              ARGS="rollback ${TAG}"
+              ;;
+            rollback-count)
+              test -n "${COUNT}" || { echo "::error::command=rollback-count requires the 'count' input" >&2; exit 1; }
+              ARGS="rollback-count ${COUNT}"
+              ;;
+            *)
+              echo "::error::unknown command ${COMMAND}" >&2; exit 1 ;;
+          esac
+          echo "args=${ARGS}" >> "$GITHUB_OUTPUT"
+          echo "liquibase args: ${ARGS}"
+
+      - name: Resolve ECR registry & log in
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      # Resolve the LATEST pushed image tag from ECR (by push time) — no
+      # hardcoded SHA, so the newest runtime image is always used.
+      - name: Resolve latest image tag
+        id: image
+        run: |
+          set -euo pipefail
+          TAG="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --region "${AWS_REGION}" \
+            --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' \
+            --output text)"
+          test -n "${TAG}" && [ "${TAG}" != "None" ] || { echo "::error::no image found in ${ECR_REPOSITORY}" >&2; exit 1; }
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "latest image tag: ${TAG}"
+
+      # Offline changelog validate (no DB): parse/checksum/structure check of the
+      # MOUNTED changelog before we touch the database. Bypasses the entrypoint
+      # and uses an offline URL so a malformed/duplicate-id changeset fails here
+      # first. The changelog comes from the checkout mount, not the image.
+      - name: Validate changelog (offline, no DB)
+        env:
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker pull "${IMAGE}"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/infra/db/rag:/work:ro" \
+            --entrypoint liquibase "${IMAGE}" \
+            --search-path=/work \
+            validate \
+            --changelog-file=changelog.xml \
+            --url="offline:postgresql"
+          echo "changelog validate (offline) passed"
+
+      # Run Liquibase directly from the VPC-attached runner. The container
+      # inherits the runner's VPC networking, so it reaches the private RAG
+      # endpoint over the peering. The entrypoint fetches the secret (the runner
+      # role has GetSecretValue on it), builds the JDBC URL, runs the command.
+      - name: Run Liquibase
+        env:
+          ARGS: ${{ steps.cmd.outputs.args }}
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker pull "${IMAGE}"
+
+          # The nested `docker run` container does NOT automatically inherit the
+          # runner's IAM-role credentials: on the host the AWS SDK resolves them
+          # via the container-credentials endpoint (169.254.170.2) named by
+          # AWS_CONTAINER_CREDENTIALS_* env vars. We forward those (and any
+          # static creds, as a fallback) into the inner container with
+          # --network host so 169.254.170.2 is reachable, so its AWS CLI assumes
+          # the same role and can read the secret. No `aws login`, no stored keys.
+          CRED_ENVS=()
+          for v in \
+            AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+            AWS_CONTAINER_CREDENTIALS_FULL_URI \
+            AWS_CONTAINER_AUTHORIZATION_TOKEN \
+            AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY \
+            AWS_SESSION_TOKEN \
+            AWS_DEFAULT_REGION ; do
+            if [ -n "${!v:-}" ]; then CRED_ENVS+=("-e" "${v}"); fi
+          done
+
+          # Mount the checked-out changelog dir into the container at /work (the
+          # entrypoint runs Liquibase from there). The changelog is NOT baked in
+          # the image — git is the source of truth, so a new changeset is just a
+          # commit, no image rebuild. :ro = the container never writes to it.
+          # shellcheck disable=SC2086 — ARGS is a controlled, space-split command.
+          docker run --rm \
+            --network host \
+            "${CRED_ENVS[@]}" \
+            -e AWS_REGION="${AWS_REGION}" \
+            -e RAG_MIGRATE_TAG="${IMAGE_TAG}" \
+            -v "${GITHUB_WORKSPACE}/infra/db/rag:/work:ro" \
+            "${IMAGE}" ${ARGS}
+          echo "liquibase ${{ inputs.command }} succeeded"

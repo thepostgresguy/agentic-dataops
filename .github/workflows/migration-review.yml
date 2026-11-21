@@ -1,0 +1,196 @@
+name: migration-review
+
+# AI review of ANY app database change — ANALYSIS ONLY. A PR is the test;
+# nothing deploys from here (deployment is deploy.yml / app-migrate.yml).
+#
+# The developer flow:
+#   1. On a branch, add a NEW Liquibase changeset
+#      infra/db/app/changesets/NNN_<name>.sql with the SQL you intend to run
+#      (and update app/prisma/schema.prisma so the Prisma client matches).
+#   2. Open a PR. This workflow:
+#        a. sends the NEW changesets' SQL to the AgentCore consultant
+#           (RAG-grounded; it also learns from agent/knowledge/decisions/);
+#        b. posts the verdict + UP TO 4 candidate approaches (never padded) as
+#           a PR comment.
+#   3. To TEST an option on an ephemeral copy, run `migration-test` with its
+#      SQL. To SHIP a different option, replace the changeset's SQL in the PR
+#      (it was never applied; only files already on main are immutable).
+#
+# NO DATABASE IS TOUCHED. Runs on the CodeBuild runner because the AgentCore
+# agent is private; the only AWS calls resolve and invoke the agent runtime.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base branch to compare the dispatched ref against"
+        type: string
+        default: main
+  # Auto-trigger disabled; run manually via workflow_dispatch.
+  # pull_request:
+  #   paths:
+  #     - infra/db/app/**
+  #     - app/prisma/schema.prisma
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  AGENT_RUNTIME_NAME: agentic_dataops_agent
+  CHANGESET_DIR: infra/db/app/changesets
+
+jobs:
+  review:
+    name: migration review
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tools (jq)
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { sudo dnf install -y jq || sudo yum install -y jq || sudo apt-get install -y jq; }
+          jq --version
+
+      - name: Resolve base commit
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            BASE="${PR_BASE_SHA}"
+          else
+            BASE_REF="${BASE_REF:-main}"
+            git check-ref-format --branch "${BASE_REF}" >/dev/null \
+              || { echo "::error::invalid base_ref: ${BASE_REF}" >&2; exit 1; }
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          fi
+          git cat-file -e "${BASE}^{commit}" || { echo "::error::base commit ${BASE} not available" >&2; exit 1; }
+          echo "Base commit: ${BASE}"
+          echo "sha=${BASE}" >> "$GITHUB_OUTPUT"
+
+      # The SQL under review = the changesets this PR ADDS, in number order —
+      # exactly what `liquibase update` would run on deploy.
+      - name: Determine SQL to review (no database)
+        id: sql
+        env:
+          BASE: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REVIEW_SQL="${RUNNER_TEMP}/review.sql"
+          : > "${REVIEW_SQL}"
+          mapfile -t ADDED < <(git diff --name-only --diff-filter=A "${BASE}...HEAD" \
+            -- "${CHANGESET_DIR}/*.sql" | LC_ALL=C sort)
+          for f in "${ADDED[@]}"; do
+            { printf -- '-- file: %s\n' "${f}"; cat "${f}"; printf '\n'; } >> "${REVIEW_SQL}"
+          done
+
+          # Model vs migration consistency hints (not failures).
+          SCHEMA_CHANGED=false
+          git diff --quiet "${BASE}...HEAD" -- app/prisma/schema.prisma || SCHEMA_CHANGED=true
+          if [ "${SCHEMA_CHANGED}" = "true" ] && [ "${#ADDED[@]}" -eq 0 ]; then
+            echo "::warning::app/prisma/schema.prisma changed but no new changeset was added; the database will not change. Add ${CHANGESET_DIR}/NNN_<name>.sql."
+          fi
+          echo "schema_changed=${SCHEMA_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "count=${#ADDED[@]}" >> "$GITHUB_OUTPUT"
+
+          echo "----- SQL to review (${#ADDED[@]} new changeset(s)) -----"
+          cat "${REVIEW_SQL}"
+          if [ "${#ADDED[@]}" -gt 0 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No new changeset in this PR"
+          fi
+
+      - name: Resolve agent runtime ARN
+        id: rt
+        if: ${{ steps.sql.outputs.has_changes == 'true' }}
+        run: |
+          set -euo pipefail
+          ARN="$(aws bedrock-agentcore-control list-agent-runtimes \
+            --region "${AWS_REGION}" \
+            --query "agentRuntimes[?agentRuntimeName=='${AGENT_RUNTIME_NAME}'].agentRuntimeArn | [0]" \
+            --output text)"
+          test -n "${ARN}" && [ "${ARN}" != "None" ] || { echo "::error::agent runtime ${AGENT_RUNTIME_NAME} not found" >&2; exit 1; }
+          echo "arn=${ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Ask the consultant agent for candidate approaches
+        id: agent
+        if: ${{ steps.sql.outputs.has_changes == 'true' }}
+        env:
+          ARN: ${{ steps.rt.outputs.arn }}
+        run: |
+          set -euo pipefail
+          { printf -- '-- source: new Liquibase changeset(s) in this PR (what liquibase update would run)\n'
+            cat "${RUNNER_TEMP}/review.sql"; } > "${RUNNER_TEMP}/payload.sql"
+          PAYLOAD_JSON="$(jq -n --rawfile sql "${RUNNER_TEMP}/payload.sql" '{migration_sql: $sql}')"
+          PAYLOAD_B64="$(printf '%s' "${PAYLOAD_JSON}" | base64 | tr -d '\n')"
+          SESSION="review-${{ github.run_id }}-${{ github.run_attempt }}-$(date +%s)-padpadpadpad"
+          aws bedrock-agentcore invoke-agent-runtime \
+            --region "${AWS_REGION}" \
+            --agent-runtime-arn "${ARN}" \
+            --runtime-session-id "${SESSION}" \
+            --payload "${PAYLOAD_B64}" \
+            "${RUNNER_TEMP}/agent-response.bin"
+          python3 -I scripts/extract_agent_text.py "${RUNNER_TEMP}/agent-response.bin" \
+            > "${RUNNER_TEMP}/agent-advice.md"
+          test -s "${RUNNER_TEMP}/agent-advice.md" || { echo "::error::empty agent response" >&2; exit 1; }
+          cat "${RUNNER_TEMP}/agent-advice.md"
+
+      - name: Write report (job summary + PR comment body)
+        if: ${{ always() && steps.sql.outputs.has_changes != '' }}
+        env:
+          HAS_CHANGES: ${{ steps.sql.outputs.has_changes }}
+          SCHEMA_CHANGED: ${{ steps.sql.outputs.schema_changed }}
+        run: |
+          set -euo pipefail
+          REPORT="${RUNNER_TEMP}/report.md"
+          {
+            echo "## Migration review"
+            echo
+            echo "_Analysis only: **no database was touched**. Nothing deploys from a PR._"
+            echo
+            if [ "${HAS_CHANGES}" != "true" ]; then
+              echo "No new changeset in this PR, so the database would not change."
+              [ "${SCHEMA_CHANGED}" = "true" ] && echo "⚠️ \`schema.prisma\` changed without a changeset: add \`${CHANGESET_DIR}/NNN_<name>.sql\`."
+            else
+              echo "### SQL under review (new changesets: what \`liquibase update\` would run)"
+              echo '```sql'; cat "${RUNNER_TEMP}/review.sql"; echo '```'
+              echo; echo "### AI consultant: verdict and up to 4 candidate approaches"
+              cat "${RUNNER_TEMP}/agent-advice.md" 2>/dev/null || echo "_(agent did not respond)_"
+              echo
+              echo "> The agent recommends; a human decides what goes to production."
+              echo "> To TEST an option, run the \`migration-test\` workflow and paste its SQL."
+              echo "> To SHIP a different option, change this PR's new changeset (never a file already on main), and keep \`schema.prisma\` in sync."
+              echo "> To TEACH the agent your decision, add a file under \`agent/knowledge/decisions/\` (see TEMPLATE.md) and run \`rag-ingest\`."
+            fi
+          } > "${REPORT}"
+          cat "${REPORT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "REPORT=${REPORT}" >> "$GITHUB_ENV"
+
+      - name: Comment on the PR
+        if: ${{ always() && github.event_name == 'pull_request' && steps.sql.outputs.has_changes != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.REPORT, 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body.slice(0, 60000),
+            });

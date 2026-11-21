@@ -1,0 +1,78 @@
+name: tofu
+
+# Phase 3 — on-demand OpenTofu deploy, run on the AWS-hosted CodeBuild runner.
+#
+# Trigger: manual only (workflow_dispatch). Never auto-runs.
+# Input `action` selects plan (default) or apply. `apply` uses -auto-approve,
+# so an apply ONLY happens when a human explicitly dispatches with action=apply.
+#
+# The job runs on the dedicated CodeBuild-hosted runner. CodeBuild provides AWS
+# credentials via the runner's IAM role (role assumption) — there are NO AWS
+# access keys stored in GitHub. The runs-on label is the AWS-documented
+# CodeBuild runner format and routes the job to the `agentic-dataops-runner`
+# CodeBuild project via its WORKFLOW_JOB_QUEUED webhook.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "OpenTofu action to run"
+        type: choice
+        required: true
+        default: plan
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  # OpenTofu CLI version to install on the runner (pinned).
+  TOFU_VERSION: "1.8.5"
+
+jobs:
+  tofu:
+    name: "tofu ${{ inputs.action }}"
+    # Route to the dedicated CodeBuild-hosted runner (AWS-documented label
+    # format: codebuild-<project-name>-<run_id>-<run_attempt>).
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    defaults:
+      run:
+        working-directory: infra/tofu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      # The `timescale` provider (permanent Tiger services, e.g. the RAG store)
+      # needs credentials at PLAN time, not just apply. They are fetched from AWS
+      # Secrets Manager (agentic-dataops/tiger/dev) by tofu-with-tiger-creds.sh,
+      # which the runner can read via its scoped GetSecretValue IAM grant — NO
+      # Tiger creds are stored in GitHub. The wrapper exports TF_VAR_ts_* and
+      # execs tofu. Every step that instantiates the provider (init/validate/
+      # plan/apply) goes through it; `fmt -check` does not need creds.
+      - name: tofu init
+        run: ./tofu-with-tiger-creds.sh init -input=false -no-color
+
+      - name: tofu fmt -check
+        run: tofu fmt -check -recursive -no-color
+
+      - name: tofu validate
+        run: ./tofu-with-tiger-creds.sh validate -no-color
+
+      - name: tofu plan
+        if: ${{ inputs.action == 'plan' }}
+        run: ./tofu-with-tiger-creds.sh plan -input=false -no-color
+
+      - name: tofu apply
+        if: ${{ inputs.action == 'apply' }}
+        run: ./tofu-with-tiger-creds.sh apply -auto-approve -input=false -no-color

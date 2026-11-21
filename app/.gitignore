@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.env
+# Prisma generated client (regenerated via `prisma generate`)
+prisma/generated/

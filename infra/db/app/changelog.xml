@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Root Liquibase changelog for the APP database (agentic-dataops-app).
+
+  Liquibase owns the app schema's migrations (and, separately, the RAG store's
+  under infra/db/rag/). Prisma is the app's query client only: keep
+  app/prisma/schema.prisma in sync with these changesets so the client types
+  match the database.
+
+  RULES (conventions; no PR check enforces them):
+    - IMMUTABLE: never edit, delete or rename a changeset file that exists on
+      main. Every change is a NEW file.
+    - NUMBERED: changesets/NNN_<name>.sql (001_baseline, 002_..., ...), new
+      ones above the highest existing number. includeAll loads files
+      alphabetically, so the number IS the apply order.
+    - Liquibase formatted SQL: the "liquibase formatted sql" header line, a
+      "changeset author:id" line per change, and a "rollback" line for each
+      (see changesets/001_baseline.sql for the exact syntax).
+  Liquibase also enforces immutability at deploy time: an edited, already
+  applied changeset fails its checksum. runOnChange / validCheckSum are
+  deliberately NOT used.
+-->
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <includeAll path="changesets" relativeToChangelogFile="true"/>
+
+</databaseChangeLog>

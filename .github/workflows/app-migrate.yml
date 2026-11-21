@@ -1,0 +1,85 @@
+name: app-migrate
+
+# Liquibase against the APP database (agentic-dataops-app). Manual only
+# (workflow_dispatch); `deploy` also runs `update` as part of a deploy.
+#
+# Changesets: infra/db/app/changesets/NNN_<name>.sql (immutable, numbered; see
+# infra/db/app/changelog.xml). Runs on the VPC-attached CodeBuild runner, which
+# reaches the private app DB over the peering. The work is in
+# scripts/liquibase_app.sh (reuses the RAG Liquibase image; changelog mounted
+# from this checkout; DSN from Secrets Manager via the runner role).
+#
+# Commands:
+#   status          pending changesets (read-only)
+#   history         applied changesets (read-only)
+#   validate        validate the changelog against the DB (read-only)
+#   update-sql      preview the SQL `update` would run (read-only)
+#   update          apply pending changesets, then tag the DB with the git SHA
+#   baseline-sync   ONE-TIME: mark 001_baseline as run without executing it,
+#                   because the app tables already exist
+#   rollback        roll back to a tag (requires `tag`) — PREFERRED rollback
+#   rollback-count  roll back the last N changesets (requires `count`)
+#   release-locks   clear a stuck Liquibase lock
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Liquibase command to run against the app DB"
+        type: choice
+        required: true
+        default: status
+        options:
+          - status
+          - history
+          - validate
+          - update-sql
+          - update
+          - baseline-sync
+          - rollback
+          - rollback-count
+          - release-locks
+      tag:
+        description: "Tag to roll back to (command=rollback)"
+        type: string
+        required: false
+        default: ""
+      count:
+        description: "Number of changesets to roll back (command=rollback-count)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-migrate
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  migrate:
+    name: "liquibase ${{ inputs.command }} (app DB)"
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout (provides the changelog mounted into the container)
+        uses: actions/checkout@v4
+
+      - name: Run Liquibase
+        env:
+          COMMAND: ${{ inputs.command }}
+          TAG: ${{ inputs.tag }}
+          COUNT: ${{ inputs.count }}
+          LIQUIBASE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${COMMAND}" in
+            rollback)       scripts/liquibase_app.sh rollback "${TAG}" ;;
+            rollback-count) scripts/liquibase_app.sh rollback-count "${COUNT}" ;;
+            *)              scripts/liquibase_app.sh "${COMMAND}" ;;
+          esac

@@ -1,0 +1,25 @@
+{
+  "name": "agentic-dataops-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "IoT telemetry demo app (TypeScript + Prisma). The int4 sensor_readings.id PK is the overflow subject.",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "start": "node dist/server.js",
+    "seed": "node dist/seed.js",
+    "ingest": "node dist/ingest.js"
+  },
+  "dependencies": {
+    "@prisma/client": "6.1.0",
+    "fastify": "^5.12.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "prisma": "6.1.0",
+    "typescript": "5.7.2"
+  }
+}

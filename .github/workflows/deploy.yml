@@ -1,0 +1,127 @@
+name: deploy
+
+# One-button deploy of the app (workflow_dispatch).
+#
+#
+# For now this is the MANUAL TRIGGER / escape hatch while the fully-automated
+# process is being built. It runs the whole chain on the AWS-hosted CodeBuild
+# runner (runner IAM role — no AWS keys):
+#   1. build + push the app image to ECR (tagged with the git SHA)
+#   2. tofu apply the runtime (ECS + ALB + ACM) at that image tag
+#   3. liquibase update (apply pending infra/db/app changesets, tag the DB)
+#   4. force a new ECS deployment onto the new task
+#
+# DNS/ACM note: the FIRST run creates the ACM cert (pending) and the ALB. The
+# tofu outputs print the two Cloudflare records to create (DNS-only):
+#   - acm_validation_record  (so the cert validates)
+#   - app_cname_record       (overflow.thepostgresguy.com -> ALB)
+# Create those in the DNS repo, then re-run this workflow; the HTTPS listener
+# finishes once the cert is validated. (Automating the DNS step via an agent is
+# a future piece — see the workshop plan.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: "Run liquibase update (infra/db/app changesets) against the app DB"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/app
+  TOFU_VERSION: "1.8.5"
+  TOFU_DIR: infra/tofu
+  APP_DB_SECRET_ID: agentic-dataops/app/database-url
+
+jobs:
+  deploy:
+    name: build, apply, migrate, deploy
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      # 1. Build + push the app image, tagged with the git SHA.
+      - name: Build & push app image
+        id: image
+        run: |
+          set -euo pipefail
+          REGISTRY="${{ steps.registry.outputs.registry }}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${REGISTRY}"
+          docker build -t "${IMAGE}" app
+          docker push "${IMAGE}"
+          echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      # tofu-with-tiger-creds.sh parses the Tiger secret with jq; ensure it is
+      # present (the other workflows install it the same way).
+      - name: Ensure jq
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { sudo dnf install -y jq || sudo yum install -y jq || sudo apt-get install -y jq; }
+          jq --version
+
+      # 2. Apply the runtime at this image tag. Prints DNS records as outputs.
+      #    The `timescale` provider needs Tiger creds at plan/apply time, so
+      #    both init and apply go through tofu-with-tiger-creds.sh (fetches
+      #    agentic-dataops/tiger/dev from Secrets Manager via the runner role and
+      #    exports TF_VAR_ts_*). Same pattern as tofu.yml — bare `tofu` here
+      #    fails with "No value for required variable ts_access_key".
+      - name: Tofu apply (runtime)
+        working-directory: ${{ env.TOFU_DIR }}
+        run: |
+          set -euo pipefail
+          ./tofu-with-tiger-creds.sh init -input=false -no-color
+          ./tofu-with-tiger-creds.sh apply -auto-approve -input=false -no-color \
+            -var "app_image_tag=${{ steps.image.outputs.sha }}"
+
+      - name: Show DNS records to create (Cloudflare, DNS-only)
+        working-directory: ${{ env.TOFU_DIR }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### DNS records to create in Cloudflare (DNS-only / grey cloud)";
+            echo '```json';
+            tofu output -json acm_validation_record;
+            tofu output -json app_cname_record;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 3. Apply pending Liquibase changesets to the app DB and tag it with this
+      #    commit's SHA (rollback point). DSN from the secret via the runner role.
+      - name: Liquibase update (app DB)
+        if: ${{ inputs.run_migrations }}
+        env:
+          LIQUIBASE_TAG: ${{ github.sha }}
+        run: scripts/liquibase_app.sh update
+
+      # 4. Force the ECS service onto the new task (image/migrations applied).
+      - name: Force new ECS deployment
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster agentic-dataops \
+            --service agentic-dataops-app \
+            --force-new-deployment \
+            --region "${AWS_REGION}" >/dev/null
+          echo "ECS service deployment triggered."

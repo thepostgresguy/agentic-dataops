@@ -1,0 +1,229 @@
+name: migration-test
+
+# Test a candidate migration approach on an EPHEMERAL database built from the
+# changesets on `main`.
+#
+# You PASTE the option's SQL. The workflow runs 7 steps:
+#   1. Create an ephemeral Tiger service (and wait until it accepts connections).
+#   2. Check out `main` (the committed source of truth for the app schema).
+#   3. Apply main's Liquibase changesets (infra/db/app) to the ephemeral with
+#      `liquibase update` (scripts/liquibase_app.sh, explicit target DSN).
+#   4. (Liquibase creates and maintains databasechangelog / databasechangeloglock
+#      itself, so the ephemeral carries its own migration history.)
+#   5. Apply the pasted option SQL to the ephemeral, capturing elapsed time,
+#      lock modes, full-table-rewrite yes/no, and any error (migration_dryrun.sh
+#      applies-and-keeps on success; the ephemeral is disposable).
+#   6. Send the option SQL + results to the AI agent for analysis (human review).
+#      AGENTIC MODE: the agent also gets a READ-ONLY DSN (dedicated `agent_ro`
+#      role on the ephemeral, SELECT-only, read-only, 5s timeout) and decides
+#      for itself which catalog lookups / queries to run before answering. Its
+#      steps are shown in the report's "Agent trace".
+#   7. Drop the ephemeral service (always).
+#
+# Schema only — NO application data (copying prod data raises sanitization /
+# compliance questions out of scope for this demo). So timing reflects empty
+# tables; the lock TYPE and rewrite yes/no are still observed. The app database
+# is NOT touched at all: nothing is dumped or read from it.
+#
+# NOTE: the ephemeral reflects `main`, not prod's live state. If main has
+# changesets that have not been deployed to prod yet, the ephemeral already has
+# them applied before the pasted option runs.
+#
+# Runs on the CodeBuild runner (ephemeral Tiger services are reached directly).
+
+on:
+  workflow_dispatch:
+    inputs:
+      option_sql:
+        description: "The candidate approach's SQL to test (paste it here)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AGENT_RUNTIME_NAME: agentic_dataops_agent
+
+jobs:
+  test:
+    name: migration-test
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure tools (psql, jq, tiger)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # psql client matching the Tiger services' major (PostgreSQL 18).
+          # AL2023 ships postgresql18 since 2023.10.20260330; --releasever=latest
+          # covers an older-pinned runner image.
+          PG_MAJOR=18
+          if ! psql --version 2>/dev/null | grep -qE "\) ${PG_MAJOR}\."; then
+            sudo dnf install -y --releasever=latest "postgresql${PG_MAJOR}" \
+              || { sudo apt-get update && sudo apt-get install -y "postgresql-client-${PG_MAJOR}"; }
+          fi
+          psql --version | grep -qE "\) ${PG_MAJOR}\." \
+            || { echo "::error::psql ${PG_MAJOR}.x required (Tiger runs PostgreSQL ${PG_MAJOR}); got: $(psql --version)" >&2; exit 1; }
+          command -v jq >/dev/null || { sudo dnf install -y jq || sudo yum install -y jq || sudo apt-get install -y jq; }
+          command -v tiger >/dev/null || curl -fsSL https://cli.tigerdata.com | sh
+          psql --version; jq --version; tiger version
+
+      - name: Resolve agent runtime ARN
+        id: rt
+        run: |
+          set -euo pipefail
+          ARN="$(aws bedrock-agentcore-control list-agent-runtimes \
+            --region "${AWS_REGION}" \
+            --query "agentRuntimes[?agentRuntimeName=='${AGENT_RUNTIME_NAME}'].agentRuntimeArn | [0]" \
+            --output text)"
+          test -n "${ARN}" && [ "${ARN}" != "None" ] || { echo "::error::agent runtime ${AGENT_RUNTIME_NAME} not found" >&2; exit 1; }
+          echo "arn=${ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the pasted option SQL to a file
+        env:
+          OPTION_SQL: ${{ inputs.option_sql }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${OPTION_SQL}" > "${RUNNER_TEMP}/option.sql"
+          test -s "${RUNNER_TEMP}/option.sql" || { echo "::error::option_sql is empty" >&2; exit 1; }
+          echo "----- option SQL to test -----"; cat "${RUNNER_TEMP}/option.sql"
+
+      # Step 1 — create the ephemeral service.
+      - name: Step 1 — create ephemeral service
+        id: prov
+        run: scripts/provision_dev_service.sh "mt-${{ github.run_id }}" >/dev/null
+
+      # Step 2 — the committed source of truth for the app schema: main.
+      - name: Step 2 — check out main (changesets source)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-src
+
+      # Steps 3–4 — build the ephemeral's schema by applying main's Liquibase
+      # changesets. liquibase update also creates databasechangelog and
+      # databasechangeloglock and releases its lock when done. The app database
+      # is not read or modified.
+      - name: Steps 3-4 — liquibase update (main's changesets) on the ephemeral
+        env:
+          EPH_DSN: ${{ steps.prov.outputs.dsn }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${EPH_DSN}"
+          test -f main-src/infra/db/app/changelog.xml \
+            || { echo "::error::main has no infra/db/app/changelog.xml" >&2; exit 1; }
+          LIQUIBASE_TARGET_DSN="${EPH_DSN}" \
+          LIQUIBASE_CHANGELOG_DIR="${GITHUB_WORKSPACE}/main-src/infra/db/app" \
+          LIQUIBASE_TAG="main-$(git -C main-src rev-parse --short HEAD)" \
+            scripts/liquibase_app.sh update
+          echo "ephemeral schema built from main's changesets"
+
+      # Step 5 — apply the option SQL, capturing time / lock / rewrite / error.
+      - name: Step 5 — apply option and capture evidence
+        env:
+          EPH_DSN: ${{ steps.prov.outputs.dsn }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${EPH_DSN}"
+          scripts/migration_dryrun.sh "${EPH_DSN}" "${RUNNER_TEMP}/option.sql" "${RUNNER_TEMP}/evidence.txt"
+
+      # Step 6a — a dedicated READ-ONLY role on the EPHEMERAL service for the
+      # agent's tools (agentic mode). SELECT-only, read-only by default, short
+      # statement timeout. Its password is random per run and dies with the
+      # service in Step 7. Never a prod or tsdbadmin credential.
+      - name: Step 6a — create read-only agent role on the ephemeral
+        id: ro
+        env:
+          EPH_DSN: ${{ steps.prov.outputs.dsn }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${EPH_DSN}"
+          RO_PW="$(openssl rand -hex 24)"
+          echo "::add-mask::${RO_PW}"
+          psql "${EPH_DSN}" -qX -v ON_ERROR_STOP=1 -v pw="${RO_PW}" -f - <<'SQL'
+          CREATE ROLE agent_ro LOGIN PASSWORD :'pw' NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 5;
+          ALTER ROLE agent_ro SET default_transaction_read_only = on;
+          ALTER ROLE agent_ro SET statement_timeout = '5s';
+          ALTER ROLE agent_ro SET idle_in_transaction_session_timeout = '10s';
+          GRANT USAGE ON SCHEMA public TO agent_ro;
+          GRANT SELECT ON ALL TABLES IN SCHEMA public TO agent_ro;
+          GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO agent_ro;
+          SQL
+          RO_DSN="$(EPH_DSN="${EPH_DSN}" RO_PW="${RO_PW}" python3 -I -c '
+          import os, urllib.parse as u
+          p = u.urlsplit(os.environ["EPH_DSN"])
+          host = p.hostname + (f":{p.port}" if p.port else "")
+          netloc = "agent_ro:" + u.quote(os.environ["RO_PW"], safe="") + "@" + host
+          print(u.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment)))
+          ')"
+          echo "::add-mask::${RO_DSN}"
+          # Prove the guardrail before handing it to the agent: a write must fail.
+          if psql "${RO_DSN}" -qX -c "CREATE TABLE _agent_write_probe (x int)" >/dev/null 2>&1; then
+            echo "::error::agent_ro could write; refusing to give it to the agent" >&2; exit 1
+          fi
+          psql "${RO_DSN}" -qXAt -c "SELECT 'agent_ro read check ok: ' || count(*) || ' public tables' FROM pg_tables WHERE schemaname = 'public'"
+          printf '%s' "${RO_DSN}" > "${RUNNER_TEMP}/ro_dsn"
+
+      # Step 6 — send the option SQL + results to the agent for analysis. The
+      # agent gets read-only tools on the ephemeral and decides what to inspect.
+      - name: Step 6 — AI analysis of the results (for human review)
+        id: agent
+        env:
+          ARN: ${{ steps.rt.outputs.arn }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$(cat "${RUNNER_TEMP}/ro_dsn")"
+          PAYLOAD_JSON="$(jq -n --rawfile sql "${RUNNER_TEMP}/option.sql" \
+                                --rawfile evidence "${RUNNER_TEMP}/evidence.txt" \
+                                --rawfile dsn "${RUNNER_TEMP}/ro_dsn" \
+                                '{migration_sql: $sql, evidence: $evidence, inspect_dsn: $dsn}')"
+          PAYLOAD_B64="$(printf '%s' "${PAYLOAD_JSON}" | base64 | tr -d '\n')"
+          SESSION="test-${{ github.run_id }}-${{ github.run_attempt }}-$(date +%s)-padpadpadpad"
+          aws bedrock-agentcore invoke-agent-runtime \
+            --region "${AWS_REGION}" \
+            --agent-runtime-arn "${ARN}" \
+            --runtime-session-id "${SESSION}" \
+            --payload "${PAYLOAD_B64}" \
+            "${RUNNER_TEMP}/agent-response.bin"
+          python3 -I scripts/extract_agent_text.py "${RUNNER_TEMP}/agent-response.bin" \
+            --trace-out "${RUNNER_TEMP}/agent-trace.txt" \
+            > "${RUNNER_TEMP}/agent-advice.md" || true
+          echo "----- agent trace -----"; cat "${RUNNER_TEMP}/agent-trace.txt" 2>/dev/null || true
+
+      - name: Report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Migration test (schema-only ephemeral copy of prod)"
+            echo
+            echo "### Option SQL tested"
+            echo '```sql'; cat "${RUNNER_TEMP}/option.sql"; echo '```'
+            echo; echo "### Evidence (elapsed / locks / rewrite / errors)"
+            echo '```'; cat "${RUNNER_TEMP}/evidence.txt" 2>/dev/null || echo "(test did not complete)"; echo '```'
+            echo; echo "### Agent trace (what the agent chose to inspect, read-only, on the ephemeral)"
+            echo '```'; cat "${RUNNER_TEMP}/agent-trace.txt" 2>/dev/null || echo "(no trace)"; echo '```'
+            echo; echo "### AI analysis (for human review)"
+            cat "${RUNNER_TEMP}/agent-advice.md" 2>/dev/null || echo "_(agent did not respond)_"
+            echo
+            echo "> Capture the decision under \`agent/knowledge/decisions/\` and run \`rag-ingest\` so the agent learns the result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Step 7 — drop the ephemeral service.
+      # Runs whenever provisioning was attempted, even if it failed or the run was
+      # cancelled partway. It targets the published service id, or falls back to
+      # the per-run NAME so a half-created service is still removed. Fails loudly
+      # if the service is still there afterwards.
+      - name: Step 7 — drop the ephemeral service
+        if: ${{ always() && steps.prov.conclusion != 'skipped' }}
+        env:
+          SERVICE_ID: ${{ steps.prov.outputs.service_id }}
+          SERVICE_NAME: mt-${{ github.run_id }}
+        run: scripts/teardown_dev_service.sh "${SERVICE_ID:-${SERVICE_NAME}}"

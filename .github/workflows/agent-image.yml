@@ -1,0 +1,85 @@
+name: agent-image
+
+# Build the AGENT container image and push it to ECR, tagged with the full git
+# commit SHA (immutable repo — SHA-only, no `latest`). Push-to-ECR ONLY: this
+# does NOT deploy to AgentCore. Deploying = a separate step that sets
+# agent_image_tag and applies the AgentCore runtime (infra/tofu/agent.tf).
+#
+# IMPORTANT: AgentCore requires ARM64 images. The CodeBuild runner is x86, so
+# we build arm64 via docker buildx + QEMU emulation and push the arm64 image.
+#
+# Triggers:
+#   - push to main touching agent/** (or this workflow)
+#   - manual workflow_dispatch
+#
+# Runs on the AWS-hosted CodeBuild runner; AWS auth is the runner's IAM role.
+
+on:
+  # Auto-trigger disabled; run manually via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "agent/**"
+  #     - ".github/workflows/agent-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/agent
+
+jobs:
+  build-push:
+    name: build & push agent image (arm64)
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (for arm64 emulation on x86 runner)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${{ steps.registry.outputs.registry }}"
+
+      # Build ARM64 (AgentCore requirement) and push in one buildx step.
+      # Context is the repo ROOT (the Dockerfile does `COPY agent/...`), with
+      # -f agent/Dockerfile.
+      - name: Build & push agent image (arm64, SHA tag)
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker buildx build \
+            --platform linux/arm64 \
+            -f agent/Dockerfile \
+            -t "${IMAGE}" \
+            --push \
+            .
+          echo "pushed ${IMAGE}"
+
+      - name: Summary
+        run: |
+          echo "### Pushed agent image (arm64)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy by setting agent_image_tag to this SHA and applying infra/tofu." >> "$GITHUB_STEP_SUMMARY"

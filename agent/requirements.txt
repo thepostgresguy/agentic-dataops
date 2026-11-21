@@ -1,0 +1,8 @@
+# Pinned deps for the DB-consultant agent (latest at build time; bump as needed).
+strands-agents==1.58.1
+strands-agents-tools==0.8.9
+bedrock-agentcore==1.24.1
+# RAG retrieval (always-on): Postgres client for pgvectorscale similarity search.
+# boto3 (Bedrock embeddings + Secrets Manager) comes transitively via the
+# strands/bedrock-agentcore stack; psycopg is the one addition.
+psycopg[binary]==3.2.3

@@ -1,0 +1,103 @@
+name: rag-ingest
+
+# Feed the RAG store: embed the knowledge corpus (agent/knowledge/*.md) into
+# public.rag_documents on the private RAG Tiger service. Runs on the
+# VPC-attached CodeBuild runner, which reaches the private RAG endpoint over the
+# peering and Bedrock/Secrets Manager via the VPC endpoints. We `docker run` the
+# ingest image with the corpus MOUNTED from the git checkout — so adding/editing
+# knowledge is just a commit, no image rebuild.
+#
+# Manual only (workflow_dispatch). Modes:
+#   incremental (default) — INSERT ... ON CONFLICT (content_hash) DO NOTHING;
+#                           only new/changed chunks are added.
+#   full                  — TRUNCATE rag_documents first, then re-ingest
+#                           everything (clean re-sync after edits/deletions).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Ingestion mode"
+        type: choice
+        required: true
+        default: incremental
+        options:
+          - incremental
+          - full
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/rag-ingest
+
+jobs:
+  ingest:
+    name: "rag-ingest ${{ inputs.mode }}"
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout (provides the corpus mounted into the container)
+        uses: actions/checkout@v4
+
+      - name: Resolve ECR registry & log in
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      - name: Resolve latest image tag
+        id: image
+        run: |
+          set -euo pipefail
+          TAG="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --region "${AWS_REGION}" \
+            --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' \
+            --output text)"
+          test -n "${TAG}" && [ "${TAG}" != "None" ] || { echo "::error::no image found in ${ECR_REPOSITORY} (build rag-ingest-image first)" >&2; exit 1; }
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "latest image tag: ${TAG}"
+
+      - name: Run ingestion
+        env:
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          INGEST_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker pull "${IMAGE}"
+
+          # Forward the runner's IAM-role credential source into the nested
+          # container (same as rag-migrate) so boto3 inside assumes the role.
+          CRED_ENVS=()
+          for v in \
+            AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+            AWS_CONTAINER_CREDENTIALS_FULL_URI \
+            AWS_CONTAINER_AUTHORIZATION_TOKEN \
+            AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY \
+            AWS_SESSION_TOKEN \
+            AWS_DEFAULT_REGION ; do
+            if [ -n "${!v:-}" ]; then CRED_ENVS+=("-e" "${v}"); fi
+          done
+
+          # Mount the checked-out corpus at /app/knowledge (ingest.py's default
+          # RAG_KNOWLEDGE_DIR). --network host so the container reaches the
+          # credential endpoint + the private DB over the runner's VPC network.
+          docker run --rm \
+            --network host \
+            "${CRED_ENVS[@]}" \
+            -e AWS_REGION="${AWS_REGION}" \
+            -e RAG_INGEST_MODE="${INGEST_MODE}" \
+            -v "${GITHUB_WORKSPACE}/agent/knowledge:/app/knowledge:ro" \
+            "${IMAGE}"
+          echo "rag-ingest ${INGEST_MODE} succeeded"

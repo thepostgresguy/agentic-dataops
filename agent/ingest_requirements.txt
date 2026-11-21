@@ -1,0 +1,4 @@
+# Dependencies for the RAG ingestion job (agent/ingest.py).
+# boto3 for Bedrock (Titan embeddings) + Secrets Manager; psycopg for Postgres.
+boto3==1.35.49
+psycopg[binary]==3.2.3

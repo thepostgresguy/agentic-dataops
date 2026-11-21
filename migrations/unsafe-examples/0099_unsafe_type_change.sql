@@ -1,0 +1,13 @@
+-- UNSAFE EXAMPLE — DO NOT APPLY TO PRODUCTION.
+--
+-- This is the naive migration Prisma autogenerates when `sensor_readings.id`
+-- changes from Int to BigInt in schema.prisma. On a 2.1-billion-row,
+-- multi-terabyte (~2 TB) table this takes an ACCESS EXCLUSIVE lock and rewrites
+-- the entire table (plus every dependent index and foreign key) — halting IoT
+-- ingestion for hours.
+--
+-- The lock/rewrite guardrail (scripts/detect_lock_rewrite.sh) statically catches
+-- this and fails CI; the human-reviewed candidate approaches (A–D) are the
+-- zero-downtime fix. This file exists only so the guardrail has something to
+-- flag — it is NOT part of the applied migration set.
+ALTER TABLE sensor_readings ALTER COLUMN id TYPE bigint;

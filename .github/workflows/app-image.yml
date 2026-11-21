@@ -1,0 +1,75 @@
+name: app-image
+
+# Build the app container image and push it to ECR, tagged with the full git
+# commit SHA (immutable repo — SHA-only, no `latest`). Push-to-ECR ONLY: this
+# does NOT deploy to ECS. Deploying = a separate, human-gated step that points
+# the ECS service at a specific SHA.
+#
+# Triggers:
+#   - push to the default branch touching app/** (or this workflow)
+#   - manual workflow_dispatch
+#
+# Runs on the AWS-hosted CodeBuild runner; AWS auth is the runner's IAM role
+# (no access keys in GitHub).
+
+on:
+  # Auto-trigger disabled; run manually via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "app/**"
+  #     - ".github/workflows/app-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/app
+
+jobs:
+  build-push:
+    name: build & push app image
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${{ steps.registry.outputs.registry }}"
+
+      - name: Build image
+        working-directory: app
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker build -t "${IMAGE}" .
+          echo "built ${IMAGE}"
+
+      - name: Push image (SHA tag)
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker push "${IMAGE}"
+          echo "pushed ${IMAGE}"
+
+      - name: Summary
+        run: |
+          echo "### Pushed image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy by pointing the ECS service/task-def at this SHA tag." >> "$GITHUB_STEP_SUMMARY"

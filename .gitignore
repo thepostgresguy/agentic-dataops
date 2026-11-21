@@ -1,0 +1,7 @@
+.venv
+.env
+
+# Python bytecode / caches (generated from .py, never committed)
+__pycache__/
+*.pyc
+*.pyo

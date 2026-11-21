@@ -1,0 +1,93 @@
+name: rag-smoke
+
+# Coded post-deploy smoke test for the RAG-enabled consultant agent. Invokes the
+# live AgentCore runtime with a known hazardous migration and asserts the agent
+# responds AND grounds its answer in the ingested knowledge base. This replaces
+# ad-hoc manual CLI checks: verification is code, gated in a workflow (charter
+# rule 4). Dispatch it after a deploy, or call it as a post-deploy gate.
+#
+# Runs on the VPC-attached CodeBuild runner (the AgentCore runtime + RAG store
+# are private); AWS auth is the runner's IAM role.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AGENT_RUNTIME_NAME: agentic_dataops_agent
+
+jobs:
+  smoke:
+    name: agent RAG smoke test
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Resolve agent runtime ARN
+        id: rt
+        run: |
+          set -euo pipefail
+          ARN="$(aws bedrock-agentcore-control list-agent-runtimes \
+            --region "${AWS_REGION}" \
+            --query "agentRuntimes[?agentRuntimeName=='${AGENT_RUNTIME_NAME}'].agentRuntimeArn | [0]" \
+            --output text)"
+          test -n "${ARN}" && [ "${ARN}" != "None" ] || { echo "::error::agent runtime ${AGENT_RUNTIME_NAME} not found — deploy it first" >&2; exit 1; }
+          echo "arn=${ARN}" >> "$GITHUB_OUTPUT"
+          echo "runtime: ${ARN}"
+
+      - name: Invoke agent with a known hazardous migration
+        id: invoke
+        env:
+          ARN: ${{ steps.rt.outputs.arn }}
+        run: |
+          set -euo pipefail
+          # The canonical hazard: naive int4->bigint PK widening (full rewrite).
+          PAYLOAD_JSON='{"migration_sql":"ALTER TABLE sensor_readings ALTER COLUMN id TYPE bigint;"}'
+          # --payload is a BLOB: the AWS CLI expects base64-encoded input.
+          PAYLOAD_B64="$(printf '%s' "${PAYLOAD_JSON}" | base64 | tr -d '\n')"
+          # runtime-session-id must be >= 33 chars; pad a unique value.
+          SESSION="smoke-session-${{ github.run_id }}-${{ github.run_attempt }}-$(date +%s)-padpadpadpad"
+
+          aws bedrock-agentcore invoke-agent-runtime \
+            --region "${AWS_REGION}" \
+            --agent-runtime-arn "${ARN}" \
+            --runtime-session-id "${SESSION}" \
+            --payload "${PAYLOAD_B64}" \
+            /tmp/agent-response.bin
+          # The response body may be raw text, streamed JSON events, or base64.
+          # Normalize: keep the raw bytes AND an attempted base64-decode, then
+          # concatenate both for the (case-insensitive, substring) grounding
+          # check — so whichever framing the runtime uses, real text is present.
+          cp /tmp/agent-response.bin /tmp/agent-response.txt
+          if base64 -d /tmp/agent-response.bin > /tmp/agent-response.decoded 2>/dev/null; then
+            cat /tmp/agent-response.decoded >> /tmp/agent-response.txt 2>/dev/null || true
+          fi
+          echo "----- agent response (first 2000 chars) -----"
+          head -c 2000 /tmp/agent-response.txt
+          echo
+          echo "----------------------------------------------"
+
+      - name: Assert the response is grounded in the knowledge base
+        run: |
+          set -euo pipefail
+          RESP="$(cat /tmp/agent-response.txt)"
+          test -n "${RESP}" || { echo "::error::empty agent response" >&2; exit 1; }
+
+          # The agent must identify the hazard (ACCESS EXCLUSIVE / rewrite) and
+          # recommend a zero-downtime path — concepts that live in the ingested
+          # knowledge base. A grounded answer should hit several of these terms.
+          hits=0
+          for term in "ACCESS EXCLUSIVE" "rewrite" "bigint" "backfill" "CONCURRENTLY" "hypertable" "expand" "zero-downtime"; do
+            if printf '%s' "${RESP}" | grep -qi -- "${term}"; then
+              hits=$((hits + 1))
+            fi
+          done
+          echo "grounding term hits: ${hits}"
+          if [ "${hits}" -lt 3 ]; then
+            echo "::error::agent response does not look grounded (only ${hits} knowledge terms matched); retrieval may not be firing — check CloudWatch for '[rag-retrieval] retrieved N passage(s)'" >&2
+            exit 1
+          fi
+          echo "smoke test passed: agent responded and the answer is grounded in the knowledge base"

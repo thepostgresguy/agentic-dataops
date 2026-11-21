@@ -1,0 +1,67 @@
+// Prisma schema for the IoT telemetry demo app.
+//
+// Prisma is the app's QUERY CLIENT only. Migrations are LIQUIBASE changesets
+// under infra/db/app/changesets/ (NNN_<name>.sql, immutable). Every database
+// change is a new changeset; update these models in the same PR so the client
+// matches the database. Never run `prisma migrate` / `prisma db push`.
+//
+// THE DEMO HAZARD: `SensorReading.id` was Int (int4) — the overflow subject,
+// about to overflow at ~2.1B rows. Changeset 002 widens it to BigInt, and this
+// model is kept in sync. The naive one-shot fix in 002,
+// `ALTER TABLE ... ALTER COLUMN id TYPE bigint`, locks + rewrites the whole
+// table; migration-review's AI catches that on the PR and proposes
+// zero-downtime alternatives (incl. the hypertable option).
+//
+// Money is ALWAYS NUMERIC(15,2) — see DeviceUsageCharge.amount.
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" for local dev; "debian-openssl-3.0.x" for the Bookworm container
+  // (OpenSSL 3) the app runs in on Fargate — otherwise the query engine fails
+  // to load with "libssl.so.1.1: cannot open shared object file".
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL") // single DSN; from AWS secret / Tiger service
+}
+
+model Device {
+  id           BigInt   @id @default(autoincrement())
+  serial       String   @unique
+  model        String
+  registeredAt DateTime @default(now()) @map("registered_at") @db.Timestamptz(6)
+
+  sensorReadings SensorReading[]
+  usageCharges   DeviceUsageCharge[]
+
+  @@map("devices")
+}
+
+model SensorReading {
+  // PRIMARY KEY widened int4 -> bigint by changeset 002 (the overflow fix).
+  id         BigInt   @id @default(autoincrement())
+  deviceId   BigInt   @map("device_id")
+  metric     String
+  value      Decimal  @db.Decimal
+  recordedAt DateTime @default(now()) @map("recorded_at") @db.Timestamptz(6)
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId], map: "sensor_readings_device_id_idx")
+  @@index([recordedAt], map: "sensor_readings_recorded_at_idx")
+  @@map("sensor_readings")
+}
+
+model DeviceUsageCharge {
+  id        BigInt   @id @default(autoincrement())
+  deviceId  BigInt   @map("device_id")
+  // Money is ALWAYS NUMERIC(15,2), never integer cents.
+  amount    Decimal  @db.Decimal(15, 2)
+  chargedAt DateTime @default(now()) @map("charged_at") @db.Timestamptz(6)
+
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@map("device_usage_charges")
+}

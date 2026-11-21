@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Root Liquibase changelog for the permanent, private RAG Tiger Cloud vector
+  store (agentic-dataops-rag). This changelog covers the RAG store ONLY; the
+  app database has its own Liquibase changelog under infra/db/app/.
+
+  The changesets below are the Liquibase-tracked equivalent of
+  infra/sql/rag_schema.sql (the human-readable source of truth). They preserve
+  that DDL verbatim. CHANGESET IMMUTABILITY RULE: once a changeset has run
+  against the RAG store, never edit its body — add a NEW changeset for any later
+  change. runOnChange / validCheckSum are deliberately NOT used.
+-->
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!--
+      includeAll auto-loads every .sql changeset in changesets/ so new changesets
+      are picked up WITHOUT editing this file. Liquibase loads them ALPHABETICALLY,
+      so the NNN_ numeric filename prefixes (001_, 002_, ... 006_, ...) define and
+      guarantee apply order. New changes = a new NNN_<name>.sql file with the next
+      number; NEVER edit a changeset already applied (immutability rule).
+    -->
+    <includeAll path="changesets" relativeToChangelogFile="true"/>
+
+</databaseChangeLog>

@@ -1,0 +1,80 @@
+name: rag-ingest-image
+
+# Build the RAG INGESTION runtime image and push it to ECR, tagged with the git
+# SHA. Like the rag-migrate image, this is a stable RUNTIME: Python + deps +
+# ingest.py. The knowledge corpus (agent/knowledge/*.md) is NOT baked — it is
+# mounted at runtime from the git checkout — so adding/editing knowledge needs
+# NO image rebuild. This image only changes when the runtime does (ingest.py,
+# deps, or the Dockerfile).
+#
+# Runs on the AWS-hosted CodeBuild runner; AWS auth is the runner's IAM role.
+# Base image pulled through the ECR pull-through cache via ECR_REGISTRY.
+
+on:
+  # Auto-trigger disabled; run manually via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "agent/ingest.py"
+  #     - "agent/ingest_requirements.txt"
+  #     - "agent/ingest.Dockerfile"
+  #     - ".github/workflows/rag-ingest-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: agentic-dataops/rag-ingest
+
+jobs:
+  build-push:
+    name: build & push rag-ingest runtime image
+    runs-on:
+      - codebuild-agentic-dataops-runner-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${{ steps.registry.outputs.registry }}"
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker build \
+            -f agent/ingest.Dockerfile \
+            --build-arg ECR_REGISTRY="${{ steps.registry.outputs.registry }}" \
+            -t "${IMAGE}" \
+            .
+          echo "built ${IMAGE}"
+
+      - name: Push image (SHA tag)
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+          docker push "${IMAGE}"
+          echo "pushed ${IMAGE}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed rag-ingest runtime image"
+            echo '```'
+            echo "${{ steps.registry.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+            echo '```'
+            echo "Corpus is mounted at run time. Ingest via rag-ingest.yml (mode=incremental|full)."
+          } >> "$GITHUB_STEP_SUMMARY"
