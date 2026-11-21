@@ -1,37 +1,52 @@
 # agentic-dataops
 
-A demo of an **agent-assisted PostgreSQL migration pipeline**. The agent
+A reference implementation of an **agent-assisted PostgreSQL migration pipeline**. The agent
 proposes, evidence decides, and a human always has the final word.
 
 ## Origin
 
 This project started as the live demo for my workshop at SRE Day NY 2026.
-After the workshop it became the repository where I show agentic DataOps in
-general: agents, ephemeral test databases and CI/CD working together on
-database changes. The workshop material (slides and abstract) is kept under
-`docs/`, and some of it still refers to the original event.
+It is now the repository where I show agentic DataOps in blog posts, videos
+and workshops: agents, ephemeral test databases and CI/CD working together on
+database changes. The original workshop material is kept under `docs/`, and
+some of it still refers to that event.
 
 > **Everything is code. There are no manual steps.** Migrations, testing,
 > deployment and teardown all run as GitHub Actions workflows or agents.
 
-## The story
+## What it does
 
-A fleet of IoT devices streams readings into `sensor_readings`, whose `id` is an
-`int4` primary key. At ~2.1 billion rows it is about to hit 2,147,483,647 and
-halt ingestion fleet-wide. The obvious fix, `ALTER COLUMN id TYPE bigint`,
-takes an `ACCESS EXCLUSIVE` lock and rewrites the whole table (hours of
-downtime). The demo shows how an AI consultant and ephemeral test databases help
-a human pick a safe, zero-downtime approach instead.
+Database changes are risky because the safe way to make one depends on the
+data, the table size and the locks involved, and a review of the SQL text alone
+doesn't show that. This repo shows a pipeline where:
 
-The candidate approaches (all kept, choosing among them is the point):
+- An AI consultant reads a proposed schema change and suggests candidate
+  approaches, informed by a knowledge base of past decisions.
+- Each candidate runs against an **ephemeral** database, and the pipeline
+  records lock modes, whether the table is rewritten, timing and errors.
+- The agent analyzes that evidence and a human decides. The decision goes back
+  into the knowledge base, so the next review starts from it.
+
+Everything is plain, swappable parts: Liquibase for migrations, GitHub Actions
+for orchestration, an agent on Amazon Bedrock AgentCore, and Tiger Cloud
+(TimescaleDB/Postgres) for the databases. Use it as a reference, or replace the
+example schema and knowledge base with your own.
+
+### Included example
+
+The repo ships with one worked scenario so you can run the pipeline end to end.
+An IoT `sensor_readings` table has an `int4` primary key that is close to its
+2,147,483,647 limit. The obvious fix, `ALTER COLUMN id TYPE bigint`, takes an
+`ACCESS EXCLUSIVE` lock and rewrites the whole table. The candidate approaches
+the example compares are:
 
 - **A** expand/contract with a shadow column, backfill and views/triggers
 - **B** new `bigint` column, dual-write, swap the primary key
 - **C** negative-range sequence stopgap (buys time, does not fix)
 - **D** convert the table to a TimescaleDB hypertable (Tiger-native)
 
-See [`docs/workshop-abstract.md`](docs/workshop-abstract.md) for the attendee
-promise.
+The app, changesets, unsafe examples and knowledge base are all built around
+this scenario. To use the pipeline for something else, replace those.
 
 ## How a change flows
 
@@ -89,10 +104,8 @@ Rules that shape the repo:
 
 - **Testing and evaluation** are ephemeral Tiger Cloud services, created per run
   and always torn down.
-- **App database** (`agentic-dataops-app`) is the workshop's stand-in for
-  production. It is private and reachable only from inside the VPC.
-- This is the **workshop** repo. The live production repo is separate and is
-  never touched from here.
+- **App database** (`agentic-dataops-app`) is the stand-in for production. It is private and reachable only from inside the VPC.
+- This is a demo repo. Point it at your own non-production databases first.
 
 ## Getting started
 
